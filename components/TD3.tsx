@@ -8,6 +8,9 @@ import {
   defaultParams,
   defaultPattern,
   demoPattern,
+  patternIndex,
+  PATTERN_GROUPS,
+  PATTERNS_PER_GROUP,
   NUM_PATTERNS,
   NUM_STEPS,
   type Gate,
@@ -40,11 +43,13 @@ const KEY_LED_POS: Record<number, number> = {
   1: 12.5, 3: 25, 6: 50, 8: 62.5, 10: 75,
 };
 const BASE_NOTE = 36; // C2
+const GROUP_LABEL = ["I", "II", "III", "IV"];
 
-const STORAGE_KEY = "td3-sr-state-v2";
-const OLD_STORAGE_KEY = "td3-sr-state-v1";
+const STORAGE_KEY = "td3-sr-state-v3";
+const OLD_STORAGE_KEY_V2 = "td3-sr-state-v2";
+const OLD_STORAGE_KEY_V1 = "td3-sr-state-v1";
 
-// migration v1 (gate booléen) -> v2 (gate note|tie|rest)
+// migration v1 (gate booléen) -> v2/v3 (gate note|tie|rest)
 function migratePattern(p: {
   length?: number;
   steps: Array<{ note: number; gate: Gate | boolean; accent: boolean; slide: boolean }>;
@@ -60,6 +65,14 @@ function migratePattern(p: {
   };
 }
 
+function formatPatternIndex(idx: number): string {
+  const group = Math.floor(idx / (PATTERNS_PER_GROUP * 2));
+  const rem = idx % (PATTERNS_PER_GROUP * 2);
+  const variant = Math.floor(rem / PATTERNS_PER_GROUP);
+  const number = rem % PATTERNS_PER_GROUP;
+  return `${GROUP_LABEL[group]}-${number + 1}${variant === 0 ? "A" : "B"}`;
+}
+
 const nextGate: Record<Gate, Gate> = { note: "tie", tie: "rest", rest: "note" };
 
 export default function TD3() {
@@ -73,10 +86,15 @@ export default function TD3() {
   const [params, setParams] = useState<SynthParams>({ ...defaultParams });
   const [patterns, setPatterns] = useState<Pattern[]>(() => {
     const arr = Array.from({ length: NUM_PATTERNS }, defaultPattern);
-    arr[0] = demoPattern();
+    arr[0] = demoPattern(); // groupe I, pattern 1A
     return arr;
   });
-  const [currentPattern, setCurrentPattern] = useState(0);
+  // sélection de pattern : groupe (I-IV) + numéro (1-8) + variante (A/B), comme le vrai
+  const [group, setGroup] = useState(0);
+  const [number, setNumber] = useState(0);
+  const [variant, setVariant] = useState<0 | 1>(0);
+  const currentPattern = patternIndex(group, number, variant);
+
   const [mode, setMode] = useState<Mode>("patt-play");
   const [playing, setPlaying] = useState(false);
   const [playhead, setPlayhead] = useState(-1);
@@ -87,18 +105,38 @@ export default function TD3() {
   const [fnActive, setFnActive] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
-  // restauration localStorage (v2, sinon migration v1)
+  // restauration localStorage (v3 direct, sinon migration depuis v2/v1)
   useEffect(() => {
     try {
-      const raw = localStorage.getItem(STORAGE_KEY) ?? localStorage.getItem(OLD_STORAGE_KEY);
-      if (raw) {
-        const s = JSON.parse(raw);
+      const rawV3 = localStorage.getItem(STORAGE_KEY);
+      if (rawV3) {
+        const s = JSON.parse(rawV3);
         if (s.params) setParams((p) => ({ ...p, ...s.params }));
         if (s.patterns) setPatterns(s.patterns.map(migratePattern));
-        if (typeof s.currentPattern === "number") setCurrentPattern(s.currentPattern);
+        if (typeof s.group === "number") setGroup(s.group);
+        if (typeof s.number === "number") setNumber(s.number);
+        if (s.variant === 0 || s.variant === 1) setVariant(s.variant);
         if (Array.isArray(s.track)) setTrack(s.track);
+      } else {
+        const rawV2 = localStorage.getItem(OLD_STORAGE_KEY_V2);
+        if (rawV2) {
+          const s = JSON.parse(rawV2);
+          if (s.params) setParams((p) => ({ ...p, ...s.params }));
+          if (s.patterns) {
+            // v2 avait 8 patterns -> deviennent groupe I, variante A, numéros 1-8
+            const arr = Array.from({ length: NUM_PATTERNS }, defaultPattern);
+            arr[0] = demoPattern();
+            s.patterns.forEach((p: Parameters<typeof migratePattern>[0], i: number) => {
+              arr[i] = migratePattern(p);
+            });
+            setPatterns(arr);
+          }
+          if (typeof s.currentPattern === "number") setNumber(s.currentPattern);
+          if (Array.isArray(s.track)) setTrack(s.track);
+        }
       }
-      localStorage.removeItem(OLD_STORAGE_KEY);
+      localStorage.removeItem(OLD_STORAGE_KEY_V1);
+      localStorage.removeItem(OLD_STORAGE_KEY_V2);
     } catch {}
     setLoaded(true);
   }, []);
@@ -109,12 +147,12 @@ export default function TD3() {
       try {
         localStorage.setItem(
           STORAGE_KEY,
-          JSON.stringify({ params, patterns, currentPattern, track }),
+          JSON.stringify({ params, patterns, group, number, variant, track }),
         );
       } catch {}
     }, 300);
     return () => clearTimeout(id);
-  }, [params, patterns, currentPattern, track, loaded]);
+  }, [params, patterns, group, number, variant, track, loaded]);
 
   // sync moteur
   useEffect(() => {
@@ -137,7 +175,13 @@ export default function TD3() {
   useEffect(() => {
     engine.onStep = (s) => {
       setPlayhead(s);
-      if (engine.trackMode) setCurrentPattern(engine.currentPattern);
+      if (engine.trackMode) {
+        const idx = engine.currentPattern;
+        setGroup(Math.floor(idx / (PATTERNS_PER_GROUP * 2)));
+        const rem = idx % (PATTERNS_PER_GROUP * 2);
+        setVariant(Math.floor(rem / PATTERNS_PER_GROUP) as 0 | 1);
+        setNumber(rem % PATTERNS_PER_GROUP);
+      }
     };
     return () => {
       engine.onStep = null;
@@ -214,12 +258,18 @@ export default function TD3() {
     if (!engine.playing) engine.releaseNote();
   }, [engine]);
 
-  const onPatternBtn = useCallback(
+  // PATTERN GROUP (I-IV) : sélectionnable à tout moment, comme le sélecteur du vrai
+  const onGroupBtn = useCallback((g: number) => setGroup(g), []);
+
+  const onVariantToggle = useCallback(() => setVariant((v) => (v === 0 ? 1 : 0)), []);
+
+  // boutons numérotés 1-8 : sélection directe, ou ajout à la chaîne en TRACK WRITE
+  const onNumberBtn = useCallback(
     (i: number) => {
-      if (mode === "track-write") setTrack((t) => [...t, i]);
-      else setCurrentPattern(i);
+      if (mode === "track-write") setTrack((t) => [...t, patternIndex(group, i, variant)]);
+      else setNumber(i);
     },
-    [mode],
+    [mode, group, variant],
   );
 
   const clearAction = useCallback(() => {
@@ -261,7 +311,7 @@ export default function TD3() {
     : writeMode
       ? `WRITE — pas ${selectedStep + 1} : clavier = note · re-clic pas = note→tie→rest · ACCENT/SLIDE = marquer`
       : mode === "track-write"
-        ? "TRACK WRITE — tapez les numéros de pattern pour construire la chaîne, CLEAR pour vider"
+        ? "TRACK WRITE — GROUP/numéro/A-B puis tapez le numéro pour ajouter à la chaîne, CLEAR pour vider"
         : "RUN pour lancer · clic pas = note/rest · TIME MODE = tie sur le pas sélectionné · FUNCTION+pas = longueur";
 
   return (
@@ -327,13 +377,20 @@ export default function TD3() {
 
             <div className="section sec-dist">
               <div className="section-label">DISTORTION</div>
-              <div className={`led${params.distortion ? " on" : ""}`} />
-              <button
-                className={`push-btn${params.distortion ? " lit" : ""}`}
-                onClick={() => setP("distortion", !params.distortion)}
-              >
-                ON
-              </button>
+              <div className="dist-knobs">
+                <Knob small label="DRIVE" value={params.distDrive} onChange={(v) => setP("distDrive", v)} defaultValue={0.5} />
+                <Knob small label="TONE" value={params.distTone} onChange={(v) => setP("distTone", v)} defaultValue={0.5} />
+                <Knob small label="LEVEL" value={params.distLevel} onChange={(v) => setP("distLevel", v)} defaultValue={0.6} />
+              </div>
+              <div className="dist-footer">
+                <div className={`led${params.distortion ? " on" : ""}`} />
+                <button
+                  className={`push-btn${params.distortion ? " lit" : ""}`}
+                  onClick={() => setP("distortion", !params.distortion)}
+                >
+                  ON
+                </button>
+              </div>
             </div>
           </div>
 
@@ -346,22 +403,43 @@ export default function TD3() {
 
             <div className="section sec-pattern">
               <div className="section-label">
-                PATTERN {mode === "track-write" ? "→ TRACK" : "GROUP"}
+                PATTERN {mode === "track-write" ? "→ TRACK" : formatPatternIndex(currentPattern)}
               </div>
-              <div className="patt-btns">
-                {Array.from({ length: NUM_PATTERNS }, (_, i) => (
-                  <button
-                    key={i}
-                    className={`patt-btn${currentPattern === i ? " active" : ""}`}
-                    onClick={() => onPatternBtn(i)}
-                  >
-                    {i + 1}
-                  </button>
-                ))}
+              <div className="pattern-selectors">
+                <div className="group-btns">
+                  {GROUP_LABEL.map((label, g) => (
+                    <button
+                      key={label}
+                      className={`group-btn${group === g ? " active" : ""}`}
+                      onClick={() => onGroupBtn(g)}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                <div className="patt-btns">
+                  {Array.from({ length: PATTERNS_PER_GROUP }, (_, i) => (
+                    <button
+                      key={i}
+                      className={`patt-btn${number === i ? " active" : ""}`}
+                      onClick={() => onNumberBtn(i)}
+                    >
+                      {i + 1}
+                    </button>
+                  ))}
+                </div>
+                <button
+                  className={`ab-toggle${variant === 1 ? " b" : ""}`}
+                  onClick={onVariantToggle}
+                  aria-label="Pattern A/B"
+                >
+                  <span className={variant === 0 ? "on" : ""}>A</span>
+                  <span className={variant === 1 ? "on" : ""}>B</span>
+                </button>
               </div>
               {mode.startsWith("track") && (
-                <div style={{ fontSize: 9, color: "#3a3c3e", fontWeight: 700 }}>
-                  CHAIN: {track.length ? track.map((t) => t + 1).join("·") : "—"}
+                <div className="chain-display">
+                  CHAIN: {track.length ? track.map(formatPatternIndex).join(" · ") : "—"}
                 </div>
               )}
             </div>

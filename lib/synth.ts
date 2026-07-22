@@ -25,7 +25,15 @@ export interface Pattern {
 }
 
 export const NUM_STEPS = 16;
-export const NUM_PATTERNS = 8;
+// Comme le vrai : 4 groupes de patterns (I, II, III, IV), 8 numéros par
+// groupe, chacun décliné en variante A et B → 64 patterns au total.
+export const PATTERN_GROUPS = 4;
+export const PATTERNS_PER_GROUP = 8;
+export const NUM_PATTERNS = PATTERN_GROUPS * PATTERNS_PER_GROUP * 2;
+
+export function patternIndex(group: number, number_: number, variant: 0 | 1): number {
+  return group * PATTERNS_PER_GROUP * 2 + variant * PATTERNS_PER_GROUP + number_;
+}
 
 export function defaultStep(): Step {
   return { note: 36, gate: "rest", accent: false, slide: false };
@@ -67,6 +75,9 @@ export interface SynthParams {
   volume: number; // 0..1
   waveform: Waveform;
   distortion: boolean;
+  distDrive: number; // 0..1
+  distTone: number; // 0..1, sombre -> brillant
+  distLevel: number; // 0..1
   tempo: number; // BPM
   triplet: boolean;
 }
@@ -81,6 +92,9 @@ export const defaultParams: SynthParams = {
   volume: 0.8,
   waveform: "sawtooth",
   distortion: false,
+  distDrive: 0.5,
+  distTone: 0.5,
+  distLevel: 0.6,
   tempo: 130,
   triplet: false,
 };
@@ -96,6 +110,12 @@ function cutoffHz(v: number): number {
 }
 
 const SLIDE_TAU = 0.018; // constante RC ≈ 60 ms de glide perçu, indépendant du tempo
+
+const TONE_CORNER_HZ = 900; // fréquence de coupure des deux filtres du tone stack
+
+function driveToK(drive: number): number {
+  return 3 + drive * 27; // pente tanh : douce à fond de dents-de-scie saturé
+}
 
 function makeDistortionCurve(amount: number): Float32Array {
   const n = 2048;
@@ -117,6 +137,11 @@ export class TD3Engine {
   private vca: GainNode | null = null;
   private accentGain: GainNode | null = null;
   private shaper: WaveShaperNode | null = null;
+  private toneLow: BiquadFilterNode | null = null; // tone stack type DS-1 : crossfade
+  private toneHigh: BiquadFilterNode | null = null; // lowpass/highpass fixe autour de ~900 Hz
+  private toneLowGain: GainNode | null = null;
+  private toneHighGain: GainNode | null = null;
+  private levelGain: GainNode | null = null;
   private distWet: GainNode | null = null;
   private distDry: GainNode | null = null;
   private master: GainNode | null = null;
@@ -194,9 +219,20 @@ export class TD3Engine {
     this.accentGain = ctx.createGain();
     this.accentGain.gain.value = 1;
 
+    // ————— distortion type DS-1 : drive (waveshaper) -> tone stack (crossfade
+    // lowpass/highpass) -> level, en parallèle du bypass sec —————
     this.shaper = ctx.createWaveShaper();
-    this.shaper.curve = makeDistortionCurve(12) as Float32Array<ArrayBuffer>;
+    this.shaper.curve = makeDistortionCurve(driveToK(this.params.distDrive)) as Float32Array<ArrayBuffer>;
     this.shaper.oversample = "4x";
+    this.toneLow = ctx.createBiquadFilter();
+    this.toneLow.type = "lowpass";
+    this.toneLow.frequency.value = TONE_CORNER_HZ;
+    this.toneHigh = ctx.createBiquadFilter();
+    this.toneHigh.type = "highpass";
+    this.toneHigh.frequency.value = TONE_CORNER_HZ;
+    this.toneLowGain = ctx.createGain();
+    this.toneHighGain = ctx.createGain();
+    this.levelGain = ctx.createGain();
     this.distWet = ctx.createGain();
     this.distDry = ctx.createGain();
 
@@ -208,7 +244,13 @@ export class TD3Engine {
     this.vca.connect(this.accentGain);
     this.accentGain.connect(this.distDry);
     this.accentGain.connect(this.shaper);
-    this.shaper.connect(this.distWet);
+    this.shaper.connect(this.toneLow);
+    this.shaper.connect(this.toneHigh);
+    this.toneLow.connect(this.toneLowGain);
+    this.toneHigh.connect(this.toneHighGain);
+    this.toneLowGain.connect(this.levelGain);
+    this.toneHighGain.connect(this.levelGain);
+    this.levelGain.connect(this.distWet);
     this.distDry.connect(this.master);
     this.distWet.connect(this.master);
     this.master.connect(ctx.destination);
@@ -218,6 +260,7 @@ export class TD3Engine {
 
     this.osc.start();
     this.setDistortion(this.params.distortion);
+    this.applyDistortionTone();
     this.applyParams();
   }
 
@@ -232,6 +275,23 @@ export class TD3Engine {
   setParam<K extends keyof SynthParams>(key: K, value: SynthParams[K]) {
     this.params[key] = value;
     this.applyParams();
+    if (key === "distDrive" || key === "distTone" || key === "distLevel") {
+      this.applyDistortionTone();
+    }
+  }
+
+  // DRIVE régénère la courbe du waveshaper (pente de saturation), TONE
+  // crossfade à puissance égale entre le chemin lowpass et highpass fixes
+  // (comme le potard tone d'une DS-1), LEVEL est le gain de sortie du wet.
+  private applyDistortionTone() {
+    if (!this.ctx || !this.shaper || !this.toneLowGain || !this.toneHighGain || !this.levelGain)
+      return;
+    const t = this.ctx.currentTime;
+    this.shaper.curve = makeDistortionCurve(driveToK(this.params.distDrive)) as Float32Array<ArrayBuffer>;
+    const tone = this.params.distTone;
+    this.toneLowGain.gain.setTargetAtTime(Math.cos((tone * Math.PI) / 2), t, 0.01);
+    this.toneHighGain.gain.setTargetAtTime(Math.sin((tone * Math.PI) / 2), t, 0.01);
+    this.levelGain.gain.setTargetAtTime(0.3 + this.params.distLevel * 1.4, t, 0.01);
   }
 
   private applyParams() {
