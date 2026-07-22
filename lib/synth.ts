@@ -1,39 +1,45 @@
 // Moteur de synthèse type TB-303 pour le TD-3-SR virtuel.
-// Chaîne : VCO (saw/square) -> VCF passe-bas résonant (2 biquads cascadés,
-// ~24 dB/oct comme le vrai) -> VCA -> distortion (waveshaper type DS-1) -> master.
+// Chaîne : VCO (saw/square) -> VCF diode-ladder (AudioWorklet, fallback 2
+// biquads cascadés) -> VCA -> distortion (waveshaper tanh) -> master.
 // Le séquenceur utilise le pattern lookahead standard Web Audio (timer JS qui
 // planifie les notes en avance sur l'horloge audio) pour un timing sans jitter.
+//
+// Sémantique des pas, comme le vrai : "note" déclenche, "tie" prolonge la note
+// précédente sans re-déclencher, "rest" = silence. Le slide (flag d'un pas
+// note) glisse vers la note SUIVANTE en temps fixe (~60 ms, circuit RC du 303)
+// et maintient le gate à travers la transition.
 
 export type Waveform = "sawtooth" | "square";
+export type Gate = "note" | "tie" | "rest";
 
 export interface Step {
   note: number; // MIDI (C1 = 24 ... C3 = 48 zone 303)
-  gate: boolean;
+  gate: Gate;
   accent: boolean;
   slide: boolean;
 }
 
 export interface Pattern {
   steps: Step[];
-  length: number;
+  length: number; // 1..16, comme le "STEP" du vrai
 }
 
 export const NUM_STEPS = 16;
 export const NUM_PATTERNS = 8;
 
 export function defaultStep(): Step {
-  return { note: 36, gate: false, accent: false, slide: false };
+  return { note: 36, gate: "rest", accent: false, slide: false };
 }
 
 export function defaultPattern(): Pattern {
   return { steps: Array.from({ length: NUM_STEPS }, defaultStep), length: NUM_STEPS };
 }
 
-// Pattern de démo — ligne acid classique en Cm
+// Pattern de démo — ligne acid classique en Cm, avec un tie et des slides
 export function demoPattern(): Pattern {
   const p = defaultPattern();
   const set = (i: number, note: number, opts: Partial<Step> = {}) => {
-    p.steps[i] = { note, gate: true, accent: false, slide: false, ...opts };
+    p.steps[i] = { note, gate: "note", accent: false, slide: false, ...opts };
   };
   set(0, 36, { accent: true });
   set(2, 36);
@@ -42,6 +48,7 @@ export function demoPattern(): Pattern {
   set(6, 36);
   set(7, 39, { accent: true });
   set(8, 36);
+  p.steps[9] = { note: 36, gate: "tie", accent: false, slide: false };
   set(10, 43, { slide: true });
   set(11, 41);
   set(12, 36, { accent: true });
@@ -61,6 +68,7 @@ export interface SynthParams {
   waveform: Waveform;
   distortion: boolean;
   tempo: number; // BPM
+  triplet: boolean;
 }
 
 export const defaultParams: SynthParams = {
@@ -74,6 +82,7 @@ export const defaultParams: SynthParams = {
   waveform: "sawtooth",
   distortion: false,
   tempo: 130,
+  triplet: false,
 };
 
 function midiToFreq(note: number, tuning: number): number {
@@ -85,6 +94,8 @@ function midiToFreq(note: number, tuning: number): number {
 function cutoffHz(v: number): number {
   return 65 * Math.pow(2, v * 6.2);
 }
+
+const SLIDE_TAU = 0.018; // constante RC ≈ 60 ms de glide perçu, indépendant du tempo
 
 function makeDistortionCurve(amount: number): Float32Array {
   const n = 2048;
@@ -100,7 +111,8 @@ function makeDistortionCurve(amount: number): Float32Array {
 export class TD3Engine {
   ctx: AudioContext | null = null;
   private osc: OscillatorNode | null = null;
-  private filter1: BiquadFilterNode | null = null;
+  ladder: AudioWorkletNode | null = null; // filtre principal (worklet)
+  private filter1: BiquadFilterNode | null = null; // fallback
   private filter2: BiquadFilterNode | null = null;
   private vca: GainNode | null = null;
   private accentGain: GainNode | null = null;
@@ -126,6 +138,11 @@ export class TD3Engine {
   private currentStep = 0;
   private lastFreq: number | null = null;
   private prevStepHadSlide = false;
+  // circuit d'accent : les accents rapprochés chargent le "condensateur" et
+  // amplifient le sweep — le fameux wow qui monte sur les accents répétés
+  private accentSweep = 0;
+
+  private initPromise: Promise<void> | null = null;
 
   onStep: ((step: number) => void) | null = null;
 
@@ -133,8 +150,12 @@ export class TD3Engine {
     return this.ctx !== null;
   }
 
-  init() {
-    if (this.ctx) return;
+  init(): Promise<void> {
+    if (!this.initPromise) this.initPromise = this.buildGraph();
+    return this.initPromise;
+  }
+
+  private async buildGraph() {
     const ctx = new AudioContext({ latencyHint: "interactive" });
     this.ctx = ctx;
 
@@ -142,14 +163,30 @@ export class TD3Engine {
     this.osc.type = this.params.waveform;
     this.osc.frequency.value = 110;
 
-    this.filter1 = ctx.createBiquadFilter();
-    this.filter2 = ctx.createBiquadFilter();
-    for (const f of [this.filter1, this.filter2]) {
-      f.type = "lowpass";
-      f.frequency.value = cutoffHz(this.params.cutoff);
+    // filtre : worklet diode-ladder, sinon 2 biquads cascadés
+    let filterIn: AudioNode;
+    let filterOut: AudioNode;
+    try {
+      await ctx.audioWorklet.addModule("/worklet/ladder-processor.js");
+      this.ladder = new AudioWorkletNode(ctx, "ladder-filter", {
+        numberOfInputs: 1,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+      });
+      filterIn = this.ladder;
+      filterOut = this.ladder;
+    } catch {
+      this.filter1 = ctx.createBiquadFilter();
+      this.filter2 = ctx.createBiquadFilter();
+      for (const f of [this.filter1, this.filter2]) {
+        f.type = "lowpass";
+        f.frequency.value = cutoffHz(this.params.cutoff);
+      }
+      this.filter1.Q.value = 0.5;
+      this.filter1.connect(this.filter2);
+      filterIn = this.filter1;
+      filterOut = this.filter2;
     }
-    // la résonance vit surtout sur le 2e pôle, comme la cascade diode du 303
-    this.filter1.Q.value = 0.5;
 
     this.vca = ctx.createGain();
     this.vca.gain.value = 0;
@@ -162,16 +199,13 @@ export class TD3Engine {
     this.shaper.oversample = "4x";
     this.distWet = ctx.createGain();
     this.distDry = ctx.createGain();
-    this.setDistortion(this.params.distortion);
 
     this.master = ctx.createGain();
     this.master.gain.value = this.params.volume * 0.5;
 
-    this.osc.connect(this.filter1);
-    this.filter1.connect(this.filter2);
-    this.filter2.connect(this.vca);
+    this.osc.connect(filterIn);
+    filterOut.connect(this.vca);
     this.vca.connect(this.accentGain);
-    // dry/wet distortion
     this.accentGain.connect(this.distDry);
     this.accentGain.connect(this.shaper);
     this.shaper.connect(this.distWet);
@@ -183,11 +217,16 @@ export class TD3Engine {
     this.master.connect(this.analyser);
 
     this.osc.start();
+    this.setDistortion(this.params.distortion);
     this.applyParams();
   }
 
   resume() {
     this.ctx?.resume();
+  }
+
+  private get cutoffParam(): AudioParam | null {
+    return this.ladder ? this.ladder.parameters.get("cutoff") ?? null : null;
   }
 
   setParam<K extends keyof SynthParams>(key: K, value: SynthParams[K]) {
@@ -200,16 +239,22 @@ export class TD3Engine {
     const t = this.ctx.currentTime;
     if (this.osc && this.osc.type !== this.params.waveform) this.osc.type = this.params.waveform;
     if (this.master) this.master.gain.setTargetAtTime(this.params.volume * 0.5, t, 0.01);
-    if (this.filter2) {
-      // Q de 0.7 à ~20 : auto-oscillation perceptible à fond, comme le vrai
+
+    if (this.ladder) {
+      const resParam = this.ladder.parameters.get("resonance");
+      resParam?.setTargetAtTime(this.params.resonance, t, 0.01);
+    } else if (this.filter2) {
       this.filter2.Q.setTargetAtTime(0.7 + this.params.resonance * 19, t, 0.01);
     }
-    // le cutoff de base est réappliqué à chaque note (l'enveloppe le module),
-    // mais on le pousse aussi hors des notes pour les tweaks à l'arrêt
-    if (!this.playing && this.filter1 && this.filter2) {
+
+    // hors lecture, refléter le cutoff immédiatement pour les tweaks à l'arrêt
+    if (!this.playing) {
       const fc = cutoffHz(this.params.cutoff);
-      this.filter1.frequency.setTargetAtTime(fc, t, 0.02);
-      this.filter2.frequency.setTargetAtTime(fc, t, 0.02);
+      const p = this.cutoffParam;
+      if (p) p.setTargetAtTime(fc, t, 0.02);
+      else
+        for (const f of [this.filter1, this.filter2])
+          f?.frequency.setTargetAtTime(fc, t, 0.02);
     }
   }
 
@@ -221,68 +266,91 @@ export class TD3Engine {
     this.distDry.gain.setTargetAtTime(on ? 0 : 1, t, 0.005);
   }
 
+  get stepDur(): number {
+    // double-croches, ou triolets de croches (12 pas par mesure) en mode triplet
+    return 60 / this.params.tempo / (this.params.triplet ? 3 : 4);
+  }
+
   // ————— déclenchement d'une note (séquenceur ou clavier) —————
-  private trigger(time: number, step: Step, slideFromPrev: boolean, stepDur: number) {
-    if (!this.ctx || !this.osc || !this.filter1 || !this.filter2 || !this.vca || !this.accentGain)
-      return;
+  // tiedSteps : nombre de pas "tie" qui suivent — prolonge le gate d'autant.
+  private trigger(
+    time: number,
+    step: Step,
+    slideFromPrev: boolean,
+    stepDur: number,
+    tiedSteps = 0,
+  ) {
+    if (!this.ctx || !this.osc || !this.vca || !this.accentGain) return;
 
     const p = this.params;
     const freq = midiToFreq(step.note, p.tuning);
 
-    // pitch : slide = glissement exponentiel depuis la note précédente
+    // pitch : slide = glide RC temps fixe depuis la note précédente
+    this.osc.frequency.cancelScheduledValues(time);
     if (slideFromPrev && this.lastFreq !== null) {
       this.osc.frequency.setValueAtTime(this.lastFreq, time);
-      this.osc.frequency.exponentialRampToValueAtTime(freq, time + stepDur * 0.9);
+      this.osc.frequency.setTargetAtTime(freq, time, SLIDE_TAU);
     } else {
       this.osc.frequency.setValueAtTime(freq, time);
     }
     this.lastFreq = freq;
 
+    // circuit d'accent : charge sur les accents rapprochés, décharge sinon
+    if (step.accent) this.accentSweep = Math.min(1, this.accentSweep * 0.6 + 0.45);
+    else this.accentSweep *= 0.5;
     const accentAmt = step.accent ? p.accent : 0;
 
     // ————— enveloppe de filtre (MEG) —————
     const baseFc = cutoffHz(p.cutoff);
-    const envAmt = p.envMod * (1 + accentAmt * 0.9);
-    const peak = Math.min(baseFc * (1 + envAmt * 14), 12000);
+    const envAmt = p.envMod * (1 + accentAmt * (0.7 + this.accentSweep * 0.8));
+    const peak = Math.min(baseFc * (1 + envAmt * 14), 11000);
     // accent = decay raccourci (le fameux "wow"), sinon DECAY 30 ms à 2 s
     const decayTime = step.accent ? 0.2 : 0.03 + Math.pow(p.decay, 1.8) * 1.97;
 
-    for (const f of [this.filter1, this.filter2]) {
-      f.frequency.cancelScheduledValues(time);
-      f.frequency.setValueAtTime(Math.max(peak, 40), time);
-      f.frequency.setTargetAtTime(baseFc, time + 0.003, decayTime / 3.5);
+    const cp = this.cutoffParam;
+    if (cp) {
+      cp.cancelScheduledValues(time);
+      cp.setValueAtTime(Math.max(peak, 40), time);
+      cp.setTargetAtTime(baseFc, time + 0.003, decayTime / 3.5);
+    } else {
+      for (const f of [this.filter1, this.filter2]) {
+        if (!f) continue;
+        f.frequency.cancelScheduledValues(time);
+        f.frequency.setValueAtTime(Math.max(peak, 40), time);
+        f.frequency.setTargetAtTime(baseFc, time + 0.003, decayTime / 3.5);
+      }
     }
 
     // ————— enveloppe d'ampli —————
     const g = this.vca.gain;
+    const gateLen = stepDur * (0.55 + tiedSteps); // les ties prolongent le gate
     if (!slideFromPrev) {
       g.cancelScheduledValues(time);
       g.setValueAtTime(0.0001, time);
       g.exponentialRampToValueAtTime(0.9, time + 0.004);
-      // note normale : gate ~55 % du pas ; slide sortant géré par la note suivante
       if (!step.slide) {
-        const gateEnd = time + stepDur * 0.55;
+        const gateEnd = time + gateLen;
         g.setValueAtTime(0.9, gateEnd);
         g.exponentialRampToValueAtTime(0.0001, gateEnd + 0.012);
       }
     } else if (!step.slide) {
-      const gateEnd = time + stepDur * 0.9;
+      const gateEnd = time + stepDur * (0.9 + tiedSteps);
       g.cancelScheduledValues(time + stepDur * 0.5);
       g.setValueAtTime(0.9, gateEnd);
       g.exponentialRampToValueAtTime(0.0001, gateEnd + 0.012);
     }
 
-    // accent = boost de volume net
-    this.accentGain.gain.setValueAtTime(1 + accentAmt * 0.8, time);
+    // accent = boost de volume net (plus le sweep chargé)
+    this.accentGain.gain.setValueAtTime(1 + accentAmt * (0.6 + this.accentSweep * 0.4), time);
   }
 
   // note jouée au clavier (hors séquenceur)
-  playNote(note: number) {
-    this.init();
+  async playNote(note: number) {
+    await this.init();
     this.resume();
     if (!this.ctx) return;
     const t = this.ctx.currentTime + 0.001;
-    this.trigger(t, { note, gate: true, accent: false, slide: false }, false, 0.3);
+    this.trigger(t, { note, gate: "note", accent: false, slide: false }, false, 0.3);
   }
 
   releaseNote() {
@@ -293,13 +361,16 @@ export class TD3Engine {
   }
 
   // ————— séquenceur —————
-  start() {
-    this.init();
+  async start() {
+    await this.init();
     this.resume();
     if (!this.ctx || this.playing) return;
     this.playing = true;
     this.currentStep = 0;
+    this.trackPos = 0;
     this.prevStepHadSlide = false;
+    this.accentSweep = 0;
+    if (this.trackMode && this.track.length > 0) this.currentPattern = this.track[0];
     this.nextNoteTime = this.ctx.currentTime + 0.06;
     this.schedulerTimer = window.setInterval(() => this.scheduler(), 25);
   }
@@ -329,9 +400,8 @@ export class TD3Engine {
     while (this.nextNoteTime < this.ctx.currentTime + lookahead) {
       this.scheduleStep(this.currentStep, this.nextNoteTime);
       const pattern = this.patterns[this.currentPattern];
-      const stepDur = 60 / this.params.tempo / 4; // double-croches
-      this.nextNoteTime += stepDur;
-      this.currentStep = (this.currentStep + 1) % pattern.length;
+      this.nextNoteTime += this.stepDur;
+      this.currentStep = (this.currentStep + 1) % Math.max(1, pattern.length);
       if (this.currentStep === 0 && this.trackMode && this.track.length > 0) {
         this.trackPos = (this.trackPos + 1) % this.track.length;
         this.currentPattern = this.track[this.trackPos];
@@ -343,16 +413,23 @@ export class TD3Engine {
     if (!this.ctx) return;
     const pattern = this.patterns[this.currentPattern];
     const step = pattern.steps[stepIndex];
-    const stepDur = 60 / this.params.tempo / 4;
+    const stepDur = this.stepDur;
 
     const delay = Math.max(0, (time - this.ctx.currentTime) * 1000);
     window.setTimeout(() => this.onStep?.(stepIndex), delay);
 
-    if (step.gate) {
-      this.trigger(time, step, this.prevStepHadSlide, stepDur);
+    if (step.gate === "note") {
+      // compter les ties qui suivent pour prolonger le gate
+      let ties = 0;
+      for (let j = 1; j < pattern.length; j++) {
+        if (pattern.steps[(stepIndex + j) % pattern.length].gate === "tie") ties++;
+        else break;
+      }
+      this.trigger(time, step, this.prevStepHadSlide, stepDur, ties);
       this.prevStepHadSlide = step.slide;
-    } else {
+    } else if (step.gate === "rest") {
       this.prevStepHadSlide = false;
     }
+    // tie : rien à faire, le gate de la note précédente couvre déjà ce pas
   }
 }
