@@ -1,0 +1,10 @@
+# TD-3-SR sur le VPS. Lance :  docker compose up -d --build
+# Nginx (voir deploy/nginx.conf) reverse-proxy sur 127.0.0.1:3200.
+services:
+  td3-sr:
+    build: .
+    image: td3-sr
+    container_name: td3-sr
+    ports:
+      - "127.0.0.1:${HOST_PORT:-3200}:3000"
+    restart: unless-stopped
