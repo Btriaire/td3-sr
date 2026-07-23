@@ -481,6 +481,15 @@ export class TD3Engine {
     else this.start();
   }
 
+  // D.S. (Dal Segno) : relance le pattern depuis le début sans couper le son
+  restart() {
+    if (!this.playing || !this.ctx) return;
+    this.currentStep = 0;
+    this.trackPos = 0;
+    if (this.trackMode && this.track.length > 0) this.currentPattern = this.track[0];
+    this.nextNoteTime = this.ctx.currentTime + 0.02;
+  }
+
   private scheduler() {
     if (!this.ctx) return;
     const lookahead = 0.12;

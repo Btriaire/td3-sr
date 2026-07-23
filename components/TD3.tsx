@@ -8,6 +8,7 @@ import {
   TD3Engine,
   defaultParams,
   defaultPattern,
+  defaultStep,
   demoPattern,
   randomPattern,
   patternIndex,
@@ -27,6 +28,16 @@ const NOTE_OFFSETS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
 const NOTE_NAMES = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B", "C"];
 const BASE_NOTE = 36; // C2
 const GROUP_LABEL = ["I", "II", "III", "IV"];
+
+// touches noires (C#/D#/F#/G#/A#) : double fonction avec FUNCTION, comme la
+// sérigraphie DEL/INS/CH/CPY/PST sous les touches du vrai
+const EDIT_FN_FOR_OFFSET: Record<number, "DEL" | "INS" | "CH" | "CPY" | "PST"> = {
+  1: "DEL",
+  3: "INS",
+  6: "CH",
+  8: "CPY",
+  10: "PST",
+};
 
 const STORAGE_KEY = "td3-sr-state-v3";
 const OLD_STORAGE_KEY_V2 = "td3-sr-state-v2";
@@ -86,6 +97,7 @@ export default function TD3() {
   const [track, setTrack] = useState<number[]>([]);
   const [octaveShift, setOctaveShift] = useState(0);
   const [fnActive, setFnActive] = useState(false);
+  const [syncOn, setSyncOn] = useState(false);
   const [loaded, setLoaded] = useState(false);
 
   // restauration localStorage (v3 direct, sinon migration depuis v2/v1)
@@ -223,8 +235,49 @@ export default function TD3() {
     [fnActive, mode, selectedStep, updateStep, setPatternLength, patterns, currentPattern],
   );
 
+  // FUNCTION + touche noire (C#/D#/F#/G#/A#) = DEL/INS/CH/CPY/PST sur le pas
+  // sélectionné, comme sur la façade du vrai (sérigraphie sous les touches).
+  const [stepClipboard, setStepClipboard] = useState<Step | null>(null);
+  const performStepEdit = useCallback(
+    (fn: "DEL" | "INS" | "CH" | "CPY" | "PST") => {
+      setPatterns((ps) =>
+        ps.map((p, i) => {
+          if (i !== currentPattern) return p;
+          const steps = [...p.steps];
+          if (fn === "DEL") {
+            steps.splice(selectedStep, 1);
+            steps.push(defaultStep());
+            return { ...p, steps, length: Math.max(1, p.length - 1) };
+          }
+          if (fn === "INS") {
+            steps.splice(selectedStep, 0, defaultStep());
+            steps.pop();
+            return { ...p, steps, length: Math.min(NUM_STEPS, p.length + 1) };
+          }
+          if (fn === "CH") {
+            steps[selectedStep] = { ...steps[selectedStep], accent: false, slide: false };
+            return { ...p, steps };
+          }
+          if (fn === "CPY") {
+            setStepClipboard(steps[selectedStep]);
+            return p;
+          }
+          // PST
+          if (stepClipboard) steps[selectedStep] = { ...stepClipboard };
+          return { ...p, steps };
+        }),
+      );
+      setFnActive(false);
+    },
+    [currentPattern, selectedStep, stepClipboard],
+  );
+
   const onKeyPress = useCallback(
     (noteOffset: number) => {
+      if (fnActive && EDIT_FN_FOR_OFFSET[noteOffset]) {
+        performStepEdit(EDIT_FN_FOR_OFFSET[noteOffset]);
+        return;
+      }
       const note = BASE_NOTE + noteOffset + octaveShift * 12;
       setHeldKey(noteOffset);
       engine.playNote(note);
@@ -233,7 +286,7 @@ export default function TD3() {
         setSelectedStep((s) => (s + 1) % NUM_STEPS);
       }
     },
-    [engine, mode, selectedStep, updateStep, octaveShift],
+    [engine, mode, selectedStep, updateStep, octaveShift, fnActive, performStepEdit],
   );
 
   const onKeyRelease = useCallback(() => {
@@ -294,7 +347,7 @@ export default function TD3() {
   }
 
   const hint = fnActive
-    ? "FUNCTION — cliquez un pas pour fixer la longueur du pattern (1–16)"
+    ? "FUNCTION — clic pas = longueur du pattern · touches noires C♯/D♯/F♯/G♯/A♯ = DEL/INS/CH/CPY/PST sur le pas sélectionné"
     : writeMode
       ? `WRITE — pas ${selectedStep + 1} : interrupteur = note · re-clic pas = note→tie→rest · ACCENT/SLIDE = marquer`
       : mode === "track-write"
@@ -330,7 +383,24 @@ export default function TD3() {
             <Knob label="ENV MOD" value={params.envMod} onChange={(v) => setP("envMod", v)} defaultValue={0.55} />
             <Knob label="DECAY" value={params.decay} onChange={(v) => setP("decay", v)} defaultValue={0.4} />
             <Knob label="ACCENT" value={params.accent} onChange={(v) => setP("accent", v)} defaultValue={0.6} />
-            <div className="knob-strip-gap" />
+            <div className="jack-row">
+              {[
+                ["FILTER", "IN", "▾"],
+                ["SYNC", "IN", "▾"],
+                ["CV", "OUT", "▴"],
+                ["GATE", "OUT", "▴"],
+                ["", "PHONES", "▴"],
+              ].map(([l1, l2, arrow], i) => (
+                <div key={i} className="jack">
+                  <div className="jack-arrow">{arrow}</div>
+                  <div className="jack-hole" />
+                  <div className="jack-label">
+                    {l1 && <span>{l1}</span>}
+                    <span>{l2}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
             <Knob label="DISTORTION" value={params.distDrive} onChange={(v) => setP("distDrive", v)} defaultValue={0.5} />
             <Knob label="TONE" value={params.distTone} onChange={(v) => setP("distTone", v)} defaultValue={0.5} />
             <Knob label="LEVEL" value={params.distLevel} onChange={(v) => setP("distLevel", v)} defaultValue={0.6} />
@@ -565,6 +635,16 @@ export default function TD3() {
             </button>
             <button className="push-btn" onClick={onTap}>
               TAP
+            </button>
+            <button className="push-btn" onClick={() => engine.restart()}>
+              D.S.
+            </button>
+            <button
+              className={`push-btn${syncOn ? " lit" : ""}`}
+              onClick={() => setSyncOn((s) => !s)}
+              title="Sync externe — décoratif, pas de MIDI dans cette édition web"
+            >
+              SYNC
             </button>
             <button
               className={`push-btn${fnActive ? " lit" : ""}`}

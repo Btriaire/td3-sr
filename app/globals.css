@@ -184,6 +184,39 @@ body {
   margin: 0 4px;
 }
 
+/* rangée de jacks décoratifs (FILTER IN / SYNC IN / CV OUT / GATE OUT / PHONES) */
+.jack-row {
+  display: flex;
+  gap: 10px;
+  align-items: flex-end;
+  padding-bottom: 8px;
+  margin: 0 4px;
+}
+.jack {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+.jack-arrow { font-size: 7px; color: #6c6e71; line-height: 1; }
+.jack-hole {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 40% 35%, #3a3b3e, #101113 70%);
+  box-shadow: inset 0 2px 3px rgba(0, 0, 0, 0.7), 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+.jack-label {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  line-height: 1.1;
+  font-size: 6px;
+  font-weight: 700;
+  color: #4a4c4f;
+  letter-spacing: 0.3px;
+}
+
 .row-mid {
   display: flex;
   gap: 10px;
@@ -578,6 +611,14 @@ body {
 .pattern-dial-num.active {
   color: #ffcdb8;
   text-shadow: 0 0 6px rgba(255, 90, 40, 1);
+}
+.pattern-dial-group {
+  position: absolute;
+  transform: translate(-50%, -50%);
+  font-size: 7px;
+  font-weight: 800;
+  color: #6c6e71;
+  pointer-events: none;
 }
 .pattern-dial-knob {
   position: absolute;

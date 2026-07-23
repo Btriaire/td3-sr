@@ -5,6 +5,10 @@
 // clic sur le corps du knob = position suivante.
 
 const POSITIONS = 8;
+// repères visuels I/II/III/IV à la frontière de chaque paire (1-2, 3-4, 5-6,
+// 7-8), comme sur la sérigraphie du vrai — purement décoratif, le groupe reste
+// piloté par les boutons dédiés du panneau
+const GROUP_TICKS = ["I", "II", "III", "IV"];
 
 export default function PatternDial({
   value,
@@ -32,6 +36,17 @@ export default function PatternDial({
             >
               {i + 1}
             </button>
+          );
+        })}
+        {GROUP_TICKS.map((label, i) => {
+          const a = ((i * 2 + 0.5) / POSITIONS) * 360 - 90;
+          const rad = (a * Math.PI) / 180;
+          const x = 50 + 60 * Math.cos(rad);
+          const y = 50 + 60 * Math.sin(rad);
+          return (
+            <div key={label} className="pattern-dial-group" style={{ left: `${x}%`, top: `${y}%` }}>
+              {label}
+            </div>
           );
         })}
         <div
