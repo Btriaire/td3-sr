@@ -80,6 +80,7 @@ export interface SynthParams {
   distLevel: number; // 0..1
   tempo: number; // BPM
   triplet: boolean;
+  swing: number; // 0..1, retarde les pas impairs (absent du vrai, ajout "web edition")
 }
 
 export const defaultParams: SynthParams = {
@@ -97,7 +98,33 @@ export const defaultParams: SynthParams = {
   distLevel: 0.6,
   tempo: 130,
   triplet: false,
+  swing: 0,
 };
+
+// Générateur de pattern acid plausible : root fréquent, quelques sauts
+// d'octave/quinte, accents et slides occasionnels, rests pour respirer.
+const SCALE_DEGREES = [0, 3, 5, 7, 10, 12]; // gamme mineure pentatonique-ish depuis la root
+export function randomPattern(length = NUM_STEPS): Pattern {
+  const root = 32 + Math.floor(Math.random() * 5); // grave, zone 303
+  const steps: Step[] = Array.from({ length: NUM_STEPS }, () => defaultStep());
+  for (let i = 0; i < NUM_STEPS; i++) {
+    const r = Math.random();
+    if (r < 0.28) {
+      steps[i] = { ...defaultStep(), gate: "rest" };
+    } else if (r < 0.36 && i > 0 && steps[i - 1].gate !== "rest") {
+      steps[i] = { ...steps[i - 1], gate: "tie", accent: false, slide: false };
+    } else {
+      const degree = Math.random() < 0.55 ? 0 : SCALE_DEGREES[Math.floor(Math.random() * SCALE_DEGREES.length)];
+      steps[i] = {
+        note: root + degree,
+        gate: "note",
+        accent: Math.random() < 0.22,
+        slide: Math.random() < 0.18,
+      };
+    }
+  }
+  return { steps, length };
+}
 
 function midiToFreq(note: number, tuning: number): number {
   const detune = (tuning - 0.5) * 12; // ±6 demi-tons
@@ -458,7 +485,13 @@ export class TD3Engine {
     if (!this.ctx) return;
     const lookahead = 0.12;
     while (this.nextNoteTime < this.ctx.currentTime + lookahead) {
-      this.scheduleStep(this.currentStep, this.nextNoteTime);
+      // swing : retarde les pas impairs, la grille elle-même reste stable
+      // (pas de dérive cumulée) — absent du vrai, ajout "web edition"
+      const swungTime =
+        this.currentStep % 2 === 1
+          ? this.nextNoteTime + this.params.swing * this.stepDur * 0.5
+          : this.nextNoteTime;
+      this.scheduleStep(this.currentStep, swungTime);
       const pattern = this.patterns[this.currentPattern];
       this.nextNoteTime += this.stepDur;
       this.currentStep = (this.currentStep + 1) % Math.max(1, pattern.length);

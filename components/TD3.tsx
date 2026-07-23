@@ -3,11 +3,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import Knob from "@/components/Knob";
 import ModeDial, { type Mode } from "@/components/ModeDial";
+import PatternDial from "@/components/PatternDial";
 import {
   TD3Engine,
   defaultParams,
   defaultPattern,
   demoPattern,
+  randomPattern,
   patternIndex,
   PATTERN_GROUPS,
   PATTERNS_PER_GROUP,
@@ -19,29 +21,10 @@ import {
   type SynthParams,
 } from "@/lib/synth";
 
-// clavier une octave : offsets depuis C, position CSS des noires (%)
-const WHITE_KEYS = [
-  { off: 0, lbl: "C" },
-  { off: 2, lbl: "D" },
-  { off: 4, lbl: "E" },
-  { off: 5, lbl: "F" },
-  { off: 7, lbl: "G" },
-  { off: 9, lbl: "A" },
-  { off: 11, lbl: "B" },
-  { off: 12, lbl: "C" },
-];
-const BLACK_KEYS = [
-  { off: 1, pos: 12.5 },
-  { off: 3, pos: 25 },
-  { off: 6, pos: 50 },
-  { off: 8, pos: 62.5 },
-  { off: 10, pos: 75 },
-];
-// position horizontale (%) de la LED de chaque offset 0..12, alignée sur sa touche
-const KEY_LED_POS: Record<number, number> = {
-  0: 6.25, 2: 18.75, 4: 31.25, 5: 43.75, 7: 56.25, 9: 68.75, 11: 81.25, 12: 93.75,
-  1: 12.5, 3: 25, 6: 50, 8: 62.5, 10: 75,
-};
+// rangée de 13 interrupteurs (comme le vrai — pas de touches piano), un octave
+// chromatique complet, offsets 0..12 depuis la racine
+const NOTE_OFFSETS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+const NOTE_NAMES = ["C", "C♯", "D", "D♯", "E", "F", "F♯", "G", "G♯", "A", "A♯", "B", "C"];
 const BASE_NOTE = 36; // C2
 const GROUP_LABEL = ["I", "II", "III", "IV"];
 
@@ -261,9 +244,7 @@ export default function TD3() {
   // PATTERN GROUP (I-IV) : sélectionnable à tout moment, comme le sélecteur du vrai
   const onGroupBtn = useCallback((g: number) => setGroup(g), []);
 
-  const onVariantToggle = useCallback(() => setVariant((v) => (v === 0 ? 1 : 0)), []);
-
-  // boutons numérotés 1-8 : sélection directe, ou ajout à la chaîne en TRACK WRITE
+  // boutons numérotés 1-8 (rotary) : sélection directe, ou ajout à la chaîne en TRACK WRITE
   const onNumberBtn = useCallback(
     (i: number) => {
       if (mode === "track-write") setTrack((t) => [...t, patternIndex(group, i, variant)]);
@@ -276,6 +257,12 @@ export default function TD3() {
     if (mode === "track-write") setTrack([]);
     else setPatterns((ps) => ps.map((p, i) => (i === currentPattern ? defaultPattern() : p)));
   }, [mode, currentPattern]);
+
+  const onRandomize = useCallback(() => {
+    setPatterns((ps) =>
+      ps.map((p, i) => (i === currentPattern ? randomPattern(p.length) : p)),
+    );
+  }, [currentPattern]);
 
   const tapTempo = useRef<number[]>([]);
   const onTap = useCallback(() => {
@@ -292,7 +279,7 @@ export default function TD3() {
   const selStep = pattern.steps[selectedStep];
   const writeMode = mode === "patt-write";
 
-  // LED clavier : note du pas joué en lecture, note du pas sélectionné en write
+  // LED des interrupteurs : note du pas joué en lecture, note du pas sélectionné en write
   let litKeyOff: number | null = null;
   const ledStep =
     playing && playhead >= 0
@@ -309,10 +296,10 @@ export default function TD3() {
   const hint = fnActive
     ? "FUNCTION — cliquez un pas pour fixer la longueur du pattern (1–16)"
     : writeMode
-      ? `WRITE — pas ${selectedStep + 1} : clavier = note · re-clic pas = note→tie→rest · ACCENT/SLIDE = marquer`
+      ? `WRITE — pas ${selectedStep + 1} : interrupteur = note · re-clic pas = note→tie→rest · ACCENT/SLIDE = marquer`
       : mode === "track-write"
-        ? "TRACK WRITE — GROUP/numéro/A-B puis tapez le numéro pour ajouter à la chaîne, CLEAR pour vider"
-        : "RUN pour lancer · clic pas = note/rest · TIME MODE = tie sur le pas sélectionné · FUNCTION+pas = longueur";
+        ? "TRACK WRITE — GROUP/numéro puis ACCENT(A)/SLIDE(B), tapez le numéro pour ajouter à la chaîne, CLEAR pour vider"
+        : "START/STOP pour lancer · clic pas = note/rest · ACCENT/SLIDE (hors write) = section A/B du pattern";
 
   return (
     <div className="stage">
@@ -335,10 +322,47 @@ export default function TD3() {
             </div>
           </div>
 
-          {/* ————— rangée knobs ————— */}
-          <div className="row-top">
+          {/* ————— bandeau continu de knobs, comme le vrai ————— */}
+          <div className="knob-strip">
+            <Knob label="TUNING" value={params.tuning} onChange={(v) => setP("tuning", v)} />
+            <Knob label="CUT OFF" value={params.cutoff} onChange={(v) => setP("cutoff", v)} defaultValue={0.45} />
+            <Knob label="RESONANCE" value={params.resonance} onChange={(v) => setP("resonance", v)} defaultValue={0.55} />
+            <Knob label="ENV MOD" value={params.envMod} onChange={(v) => setP("envMod", v)} defaultValue={0.55} />
+            <Knob label="DECAY" value={params.decay} onChange={(v) => setP("decay", v)} defaultValue={0.4} />
+            <Knob label="ACCENT" value={params.accent} onChange={(v) => setP("accent", v)} defaultValue={0.6} />
+            <div className="knob-strip-gap" />
+            <Knob label="DISTORTION" value={params.distDrive} onChange={(v) => setP("distDrive", v)} defaultValue={0.5} />
+            <Knob label="TONE" value={params.distTone} onChange={(v) => setP("distTone", v)} defaultValue={0.5} />
+            <Knob label="LEVEL" value={params.distLevel} onChange={(v) => setP("distLevel", v)} defaultValue={0.6} />
+          </div>
+
+          {/* ————— rangée sections : tempo / swing / waveform / pattern / mode / distortion / volume ————— */}
+          <div className="row-mid">
+            <div className="section sec-tempo">
+              <div className="section-label">TEMPO</div>
+              <Knob
+                small
+                label={`${params.tempo} BPM`}
+                value={(params.tempo - 40) / 260}
+                onChange={(v) => setP("tempo", Math.round(40 + v * 260))}
+                defaultValue={(130 - 40) / 260}
+              />
+              <div className="tempo-range">SLOW · FAST</div>
+            </div>
+
+            <div className="section sec-swing">
+              <div className="section-label">SWING</div>
+              <Knob
+                small
+                label={`${Math.round(params.swing * 100)}%`}
+                value={params.swing}
+                onChange={(v) => setP("swing", v)}
+                defaultValue={0}
+              />
+            </div>
+
             <div className="section sec-vco">
-              <div className="section-label">VCO</div>
+              <div className="section-label">WAVEFORM</div>
               <div className="wave-unit">
                 <div className="wave-icons">
                   <span>⎍</span>
@@ -358,54 +382,14 @@ export default function TD3() {
                     style={{ top: params.waveform === "square" ? 2 : 26 }}
                   />
                 </div>
-                <div className="knob-label">WAVEFORM</div>
               </div>
-            </div>
-
-            <div className="section sec-sound">
-              <div className="section-label">SOUND</div>
-              <div className="knob-row">
-                <Knob label="TUNING" value={params.tuning} onChange={(v) => setP("tuning", v)} />
-                <Knob label="CUT OFF" value={params.cutoff} onChange={(v) => setP("cutoff", v)} defaultValue={0.45} />
-                <Knob label="RESONANCE" value={params.resonance} onChange={(v) => setP("resonance", v)} defaultValue={0.55} />
-                <Knob label="ENV MOD" value={params.envMod} onChange={(v) => setP("envMod", v)} defaultValue={0.55} />
-                <Knob label="DECAY" value={params.decay} onChange={(v) => setP("decay", v)} defaultValue={0.4} />
-                <Knob label="ACCENT" value={params.accent} onChange={(v) => setP("accent", v)} defaultValue={0.6} />
-                <Knob label="VOLUME" value={params.volume} onChange={(v) => setP("volume", v)} defaultValue={0.8} />
-              </div>
-            </div>
-
-            <div className="section sec-dist">
-              <div className="section-label">DISTORTION</div>
-              <div className="dist-knobs">
-                <Knob small label="DRIVE" value={params.distDrive} onChange={(v) => setP("distDrive", v)} defaultValue={0.5} />
-                <Knob small label="TONE" value={params.distTone} onChange={(v) => setP("distTone", v)} defaultValue={0.5} />
-                <Knob small label="LEVEL" value={params.distLevel} onChange={(v) => setP("distLevel", v)} defaultValue={0.6} />
-              </div>
-              <div className="dist-footer">
-                <div className={`led${params.distortion ? " on" : ""}`} />
-                <button
-                  className={`push-btn${params.distortion ? " lit" : ""}`}
-                  onClick={() => setP("distortion", !params.distortion)}
-                >
-                  ON
-                </button>
-              </div>
-            </div>
-          </div>
-
-          {/* ————— rangée mode / tempo / transport ————— */}
-          <div className="row-mid">
-            <div className="section sec-mode">
-              <div className="section-label">MODE</div>
-              <ModeDial mode={mode} onChange={setMode} />
             </div>
 
             <div className="section sec-pattern">
               <div className="section-label">
-                PATTERN {mode === "track-write" ? "→ TRACK" : formatPatternIndex(currentPattern)}
+                TRACK / PATTERN GROUP — {mode === "track-write" ? "→ TRACK" : formatPatternIndex(currentPattern)}
               </div>
-              <div className="pattern-selectors">
+              <div className="pattern-dial-area">
                 <div className="group-btns">
                   {GROUP_LABEL.map((label, g) => (
                     <button
@@ -417,25 +401,7 @@ export default function TD3() {
                     </button>
                   ))}
                 </div>
-                <div className="patt-btns">
-                  {Array.from({ length: PATTERNS_PER_GROUP }, (_, i) => (
-                    <button
-                      key={i}
-                      className={`patt-btn${number === i ? " active" : ""}`}
-                      onClick={() => onNumberBtn(i)}
-                    >
-                      {i + 1}
-                    </button>
-                  ))}
-                </div>
-                <button
-                  className={`ab-toggle${variant === 1 ? " b" : ""}`}
-                  onClick={onVariantToggle}
-                  aria-label="Pattern A/B"
-                >
-                  <span className={variant === 0 ? "on" : ""}>A</span>
-                  <span className={variant === 1 ? "on" : ""}>B</span>
-                </button>
+                <PatternDial value={number} onChange={onNumberBtn} />
               </div>
               {mode.startsWith("track") && (
                 <div className="chain-display">
@@ -444,24 +410,39 @@ export default function TD3() {
               )}
             </div>
 
-            <div className="section sec-tempo">
-              <div className="section-label">TEMPO</div>
-              <div className="tempo-knob-col">
-                <div className={`led${playing && playhead % 4 === 0 ? " on" : ""}`} />
-                <Knob
-                  small
-                  label={`${params.tempo} BPM`}
-                  value={(params.tempo - 40) / 260}
-                  onChange={(v) => setP("tempo", Math.round(40 + v * 260))}
-                  defaultValue={(130 - 40) / 260}
-                />
+            <div className="section sec-mode">
+              <div className="section-label">MODE</div>
+              <ModeDial mode={mode} onChange={setMode} />
+            </div>
+
+            <div className="logo-block">
+              <div className={`led${playing && playhead % 4 === 0 ? " on" : ""}`} />
+              <div className="behringer-mini">behringer</div>
+            </div>
+
+            <div className="section sec-dist-switch">
+              <div className="section-label">DISTORTION</div>
+              <div
+                className="hswitch"
+                onClick={() => setP("distortion", !params.distortion)}
+                role="switch"
+                aria-checked={params.distortion}
+                aria-label="Distortion on/off"
+              >
+                <span className={!params.distortion ? "on" : ""}>OFF</span>
+                <span className={params.distortion ? "on" : ""}>ON</span>
+                <div className="hswitch-thumb" style={{ left: params.distortion ? "50%" : "2px" }} />
               </div>
-              <button className={`push-btn run-btn${playing ? " lit" : ""}`} onClick={togglePlay}>
-                {playing ? "■ STOP" : "▶ RUN"}
-              </button>
-              <button className="push-btn" onClick={onTap}>
-                TAP
-              </button>
+            </div>
+
+            <div className="section sec-volume">
+              <div className="section-label">VOLUME</div>
+              <Knob
+                label={`${Math.round(params.volume * 100)}%`}
+                value={params.volume}
+                onChange={(v) => setP("volume", v)}
+                defaultValue={0.8}
+              />
             </div>
           </div>
 
@@ -495,40 +476,20 @@ export default function TD3() {
             ))}
           </div>
 
-          {/* ————— clavier + touches fonction ————— */}
+          {/* ————— rangée d'interrupteurs (notes) + fonctions ————— */}
           <div className="kb-row">
-            <div className="kb-main">
-              <div className="key-leds">
-                {Object.entries(KEY_LED_POS).map(([off, pos]) => (
-                  <div
-                    key={off}
-                    className={`led${litKeyOff === Number(off) ? " on" : ""}`}
-                    style={{ left: `${pos}%` }}
+            <div className="note-switches">
+              {NOTE_OFFSETS.map((off, i) => (
+                <div key={off} className="switch-col">
+                  <div className={`led${litKeyOff === off ? " on" : ""}`} />
+                  <button
+                    className={`rocker-switch${heldKey === off ? " down" : ""}`}
+                    onPointerDown={() => onKeyPress(off)}
+                    onPointerUp={onKeyRelease}
+                    onPointerLeave={() => heldKey === off && onKeyRelease()}
                   />
-                ))}
-              </div>
-              {WHITE_KEYS.map((k, i) => (
-                <div
-                  key={i}
-                  className={`key-white${heldKey === k.off ? " down" : ""}`}
-                  onPointerDown={() => onKeyPress(k.off)}
-                  onPointerUp={onKeyRelease}
-                  onPointerLeave={() => heldKey === k.off && onKeyRelease()}
-                >
-                  {k.lbl}
+                  <div className="rocker-label">{NOTE_NAMES[i]}</div>
                 </div>
-              ))}
-              {BLACK_KEYS.map((k, i) => (
-                <div
-                  key={i}
-                  className={`key-black${heldKey === k.off ? " down" : ""}`}
-                  style={{ left: `${k.pos}%` }}
-                  onPointerDown={(e) => {
-                    e.stopPropagation();
-                    onKeyPress(k.off);
-                  }}
-                  onPointerUp={onKeyRelease}
-                />
               ))}
             </div>
             <div className="fn-keys">
@@ -547,22 +508,37 @@ export default function TD3() {
                 UP
               </button>
               <button
-                className={`fn-key${writeMode && selStep.accent ? " lit" : ""}`}
-                onClick={() => writeMode && updateStep(selectedStep, { accent: !selStep.accent })}
+                className={`fn-key${writeMode ? (selStep.accent ? " lit" : "") : variant === 0 ? " lit" : ""}`}
+                onClick={() =>
+                  writeMode ? updateStep(selectedStep, { accent: !selStep.accent }) : setVariant(0)
+                }
               >
-                ACCENT
+                {writeMode ? "ACCENT" : "ACCENT · A"}
               </button>
               <button
-                className={`fn-key${writeMode && selStep.slide ? " lit" : ""}`}
-                onClick={() => writeMode && updateStep(selectedStep, { slide: !selStep.slide })}
+                className={`fn-key${writeMode ? (selStep.slide ? " lit" : "") : variant === 1 ? " lit" : ""}`}
+                onClick={() =>
+                  writeMode ? updateStep(selectedStep, { slide: !selStep.slide }) : setVariant(1)
+                }
               >
-                SLIDE
+                {writeMode ? "SLIDE" : "SLIDE · B"}
               </button>
             </div>
           </div>
 
-          {/* ————— rangée fonctions ————— */}
+          {/* ————— rangée du bas : transport + fonctions ————— */}
           <div className="bottom-row">
+            <div className="transport-cluster">
+              <button className="push-btn" onClick={clearAction}>
+                CLEAR
+              </button>
+              <button className={`push-btn run-btn${playing ? " lit" : ""}`} onClick={togglePlay}>
+                {playing ? "■" : "▶"} START/STOP
+              </button>
+              <button className="push-btn rand-btn" onClick={onRandomize}>
+                RAND
+              </button>
+            </div>
             <button
               className={`push-btn${writeMode ? " lit" : ""}`}
               onClick={() => setMode(writeMode ? "patt-play" : "patt-write")}
@@ -587,6 +563,9 @@ export default function TD3() {
             >
               WRITE / NEXT
             </button>
+            <button className="push-btn" onClick={onTap}>
+              TAP
+            </button>
             <button
               className={`push-btn${fnActive ? " lit" : ""}`}
               onClick={() => setFnActive((f) => !f)}
@@ -598,9 +577,6 @@ export default function TD3() {
               onClick={() => setP("triplet", !params.triplet)}
             >
               TRIPLET
-            </button>
-            <button className="push-btn" onClick={clearAction}>
-              CLEAR
             </button>
             <div className="spacer" />
             <div style={{ fontSize: 8.5, color: "#4a4c4f", fontWeight: 600, letterSpacing: 0.5 }}>
